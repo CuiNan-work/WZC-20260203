@@ -62,9 +62,9 @@ blk_a = 0.05
 blk_b = 0.005
 
 # 奖励权重
-w_time = 0.4
+w_time = 0.5
 w_fair = 0.3
-w_dist = 0.3  # 距离奖励权重，鼓励UAV靠近服务的用户
+w_rate = 0.2  # 通信速率奖励权重，鼓励UAV优化位置以提高通信质量
 
 class UAVEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -114,8 +114,8 @@ class UAVEnv(gym.Env):
         self.normalized_delay = 0
         # 归一化Jain
         self.normalized_Jain = 0
-        # 归一化距离(UAV与服务用户的平均距离)
-        self.normalized_distance = 0
+        # 归一化通信速率
+        self.normalized_rate = 0
 
         # 奖励
         self.reward = 0
@@ -163,6 +163,11 @@ class UAVEnv(gym.Env):
 
         # 预估最大最小时延
         self.compute_normalization_bounds()
+        
+        # 预计算理论最大速率（用于速率归一化）
+        h_best = PL0 / (uav_H ** 2)  # 最小距离（正下方）时的信道增益
+        SNR_best = P * h_best / P_n_W
+        self.R_max_theoretical = B_total * np.log2(1 + SNR_best) * 1e-6  # Mbps
 
 
     # 环境重置
@@ -192,7 +197,7 @@ class UAVEnv(gym.Env):
 
         self.normalized_delay = 0 # 归一化时延
         self.normalized_Jain = 0  # 归一化Jain
-        self.normalized_distance = 0  # 归一化距离
+        self.normalized_rate = 0  # 归一化通信速率
 
         obs = self._get_obs()
         info = {}
@@ -242,7 +247,7 @@ class UAVEnv(gym.Env):
         # 归一化
         self.normalize_delay()
         self.normalize_Jain()
-        self.normalize_distance()
+        self.normalize_rate()
 
         # 计算step奖励
         self.compute_step_reward()
@@ -273,7 +278,7 @@ class UAVEnv(gym.Env):
             "Jain_step": self.Jain_step,
             "normalized_delay": self.normalized_delay,
             "normalized_Jain": self.normalized_Jain,
-            "normalized_distance": self.normalized_distance,
+            "normalized_rate": self.normalized_rate,
             "uav_load": self.uav_L.copy(),
             "step": self.step_count,
             "reward": self.reward,
@@ -624,40 +629,37 @@ class UAVEnv(gym.Env):
 
         self.normalized_Jain = (self.Jain_step - min_jain) / jain_range
 
-    # 计算并归一化UAV与服务用户之间的平均距离
-    def normalize_distance(self):
+    # 计算并归一化平均通信速率
+    def normalize_rate(self):
         """
-        计算每个UAV与其服务的用户之间的平均距离，并进行归一化。
-        距离越小，归一化值越大（奖励越高）。
+        计算卸载用户的平均通信速率，并进行归一化。
+        通信速率自然反映了UAV的位置优化效果（通过信道增益）。
+        速率越高，归一化值越大（奖励越高）。
         """
-        # 确保UAV-GT距离已计算
-        self.compute_UAV_GT()
-        
-        total_distance = 0.0
+        total_rate = 0.0
         served_user_count = 0
         
         for k in range(num_users):
             uav_id = self.user_decisions[k]
             if uav_id > 0:  # 用户卸载到UAV
-                # 获取该用户与对应UAV之间的距离
-                dist = self.UAV_GT[uav_id - 1, k]
-                total_distance += dist
+                # 获取该用户的卸载速率
+                rate = self.uav_unload_rate[uav_id - 1, k]
+                total_rate += rate
                 served_user_count += 1
         
         if served_user_count == 0:
-            # 如果没有用户卸载，距离设为最大（惩罚）
-            avg_distance = np.sqrt(2 * 400**2 + uav_H**2)  # 最大可能距离
+            # 如果没有用户卸载，速率设为0
+            avg_rate = 0.0
         else:
-            avg_distance = total_distance / served_user_count
+            avg_rate = total_rate / served_user_count
         
-        # 归一化距离到 [0, 1]
-        # 最小距离约为 uav_H (50m)，最大距离约为对角线距离 sqrt(2*400^2 + 50^2) ≈ 566m
-        min_dist = uav_H  # 最小可能距离（正下方）
-        max_dist = np.sqrt(2 * 400**2 + uav_H**2)  # 最大对角线距离 ≈ 566m
+        # 使用预计算的理论最大速率进行归一化
+        if self.R_max_theoretical > 1e-10:  # 防止除零
+            normalized = avg_rate / self.R_max_theoretical
+        else:
+            normalized = 0.0
         
-        # 将距离映射到 [0, 1]，距离越小值越大
-        normalized = (max_dist - avg_distance) / (max_dist - min_dist)
-        self.normalized_distance = np.clip(normalized, 0.0, 1.0)
+        self.normalized_rate = np.clip(normalized, 0.0, 1.0)
 
     # 计算step奖励
     def compute_step_reward(self):
@@ -667,11 +669,11 @@ class UAVEnv(gym.Env):
         # 负载均衡奖励：Jain指数越高奖励越高
         fairness_reward = self.normalized_Jain
         
-        # 距离奖励：UAV与服务用户距离越近奖励越高
-        distance_reward = self.normalized_distance
+        # 通信速率奖励：速率越高说明UAV位置越好（信道质量更好）
+        rate_reward = self.normalized_rate
         
         # 综合奖励
-        self.reward = w_time * delay_reward + w_fair * fairness_reward + w_dist * distance_reward
+        self.reward = w_time * delay_reward + w_fair * fairness_reward + w_rate * rate_reward
 
         self.reward_history.append(self.reward)
 
@@ -698,7 +700,7 @@ class CustomPrintCallback(BaseCallback):
             print(f"Episode {self.episode:4d} | Step {self.episode_step:5d} | Reward {reward:9.4f}")
             print(f"  Total time : {info['total_time']:.4f} s")
             print(f"  Jain step  : {info['Jain_step']:.4f} "
-                  f"(norm_delay={info['normalized_delay']:.4f}, norm_jain={info['normalized_Jain']:.4f}, norm_dist={info['normalized_distance']:.4f})")
+                  f"(norm_delay={info['normalized_delay']:.4f}, norm_jain={info['normalized_Jain']:.4f}, norm_rate={info['normalized_rate']:.4f})")
             print(f"  UAV load   : {info['uav_load']}")
 
             # 信道与速率
