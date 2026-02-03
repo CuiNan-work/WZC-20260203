@@ -62,8 +62,9 @@ blk_a = 0.05
 blk_b = 0.005
 
 # 奖励权重
-w_time = 0.6
-w_fair = 0.4
+w_time = 0.4      # 总时延奖励权重
+w_fair = 0.3      # 负载均衡奖励权重
+w_comm = 0.3      # 通信时延奖励权重（直接反映UAV位置对通信质量的影响）
 
 class UAVEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -113,6 +114,8 @@ class UAVEnv(gym.Env):
         self.normalized_delay = 0
         # 归一化Jain
         self.normalized_Jain = 0
+        # 归一化通信时延（直接反映UAV位置对通信的影响）
+        self.normalized_comm_delay = 0
 
         # 奖励
         self.reward = 0
@@ -189,6 +192,7 @@ class UAVEnv(gym.Env):
 
         self.normalized_delay = 0 # 归一化时延
         self.normalized_Jain = 0  # 归一化Jain
+        self.normalized_comm_delay = 0  # 归一化通信时延
 
         obs = self._get_obs()
         info = {}
@@ -238,6 +242,7 @@ class UAVEnv(gym.Env):
         # 归一化
         self.normalize_delay()
         self.normalize_Jain()
+        self.normalize_comm_delay()
 
         # 计算step奖励
         self.compute_step_reward()
@@ -268,6 +273,7 @@ class UAVEnv(gym.Env):
             "Jain_step": self.Jain_step,
             "normalized_delay": self.normalized_delay,
             "normalized_Jain": self.normalized_Jain,
+            "normalized_comm_delay": self.normalized_comm_delay,
             "uav_load": self.uav_L.copy(),
             "step": self.step_count,
             "reward": self.reward,
@@ -383,7 +389,8 @@ class UAVEnv(gym.Env):
 
         for m in range(num_uavs):
             for k in range(num_users):
-                h_urg[m, k] = h_rg[k].conj().T @ ris_matrix @ h_ur[m] # 复数标量
+                result = h_rg[k].conj().T @ ris_matrix @ h_ur[m] # 复数标量
+                h_urg[m, k] = result.item() if hasattr(result, 'item') else result.flatten()[0]
 
         return h_urg
 
@@ -617,10 +624,54 @@ class UAVEnv(gym.Env):
 
         self.normalized_Jain = (self.Jain_step - min_jain) / jain_range
 
+    # 归一化通信时延
+    def normalize_comm_delay(self):
+        """
+        将通信时延归一化到 [0, 1] 范围。
+        通信时延直接受UAV位置影响，是轨迹优化最自然的反馈信号。
+        通信时延越小，归一化值越小，奖励越高（取 1 - normalized）。
+        """
+        # 计算当前通信时延总和
+        total_comm_delay = np.sum(self.users_comm_delay)
+        
+        # 使用预计算的理论范围进行归一化
+        # 最大通信时延：所有用户卸载，最差信道条件
+        # 最小通信时延：0（所有用户本地计算）或接近0（最佳信道）
+        
+        # 估算最大通信时延
+        # 最差情况：所有用户卸载到最远的UAV
+        max_distance_3d = np.sqrt(2 * 400**2 + uav_H**2)  # 最大距离
+        h_worst = PL0 / (max_distance_3d ** 2)  # 最差信道增益
+        SNR_worst = P * h_worst / P_n_W
+        R_worst = (B_total / num_users) * np.log2(1 + SNR_worst) * 1e-6  # Mbps
+        R_worst = max(R_worst, 1e-6)  # 防止除零
+        max_comm_delay = num_users * L_max / R_worst
+        
+        # 最小通信时延约为0
+        min_comm_delay = 0.0
+        
+        # 归一化
+        delay_range = max_comm_delay - min_comm_delay
+        if delay_range < 1e-8:
+            delay_range = 1.0
+        
+        normalized = (total_comm_delay - min_comm_delay) / delay_range
+        self.normalized_comm_delay = np.clip(normalized, 0.0, 1.0)
+
     # 计算step奖励
     def compute_step_reward(self):
-
-        self.reward = w_time * (1 - self.normalized_delay) + w_fair * self.normalized_Jain
+        # 总时延奖励：总时延越小奖励越高
+        delay_reward = 1 - self.normalized_delay
+        
+        # 负载均衡奖励：Jain指数越高奖励越高
+        fairness_reward = self.normalized_Jain
+        
+        # 通信时延奖励：通信时延越小说明UAV位置越好（信道质量更好）
+        # 这是最自然的轨迹优化信号，不需要人为添加距离或速率约束
+        comm_delay_reward = 1 - self.normalized_comm_delay
+        
+        # 综合奖励
+        self.reward = w_time * delay_reward + w_fair * fairness_reward + w_comm * comm_delay_reward
 
         self.reward_history.append(self.reward)
 
@@ -647,7 +698,7 @@ class CustomPrintCallback(BaseCallback):
             print(f"Episode {self.episode:4d} | Step {self.episode_step:5d} | Reward {reward:9.4f}")
             print(f"  Total time : {info['total_time']:.4f} s")
             print(f"  Jain step  : {info['Jain_step']:.4f} "
-                  f"(norm_delay={info['normalized_delay']:.4f}, norm_jain={info['normalized_Jain']:.4f})")
+                  f"(norm_delay={info['normalized_delay']:.4f}, norm_jain={info['normalized_Jain']:.4f}, norm_comm={info['normalized_comm_delay']:.4f})")
             print(f"  UAV load   : {info['uav_load']}")
 
             # 信道与速率

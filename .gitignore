@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Training artifacts
+*.png
+ppo_uav_tensorboard/
+*.zip
+
+# IDE
+.idea/
+.vscode/
